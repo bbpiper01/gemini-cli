@@ -22,6 +22,7 @@ import { getAllSessionFiles, type SessionFileEntry } from './sessionUtils.js';
 // Constants
 export const DEFAULT_MIN_RETENTION = '1d' as string;
 const MIN_MAX_COUNT = 1;
+const FILE_PROCESSING_CONCURRENCY = 8;
 const MULTIPLIERS = {
   h: 60 * 60 * 1000, // hours to ms
   d: 24 * 60 * 60 * 1000, // days to ms
@@ -51,6 +52,35 @@ function isStringProperty<T extends string>(
 
 function isSessionIdRecord(record: unknown): record is { sessionId: string } {
   return isStringProperty(record, 'sessionId');
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) {
+    return [];
+  }
+
+  const results = new Array(items.length) as R[];
+  let nextIndex = 0;
+
+  const workers = Array.from(
+    { length: Math.min(concurrency, items.length) },
+    async () => {
+      while (true) {
+        const index = nextIndex++;
+        if (index >= items.length) {
+          return;
+        }
+        results[index] = await mapper(items[index]);
+      }
+    },
+  );
+
+  await Promise.all(workers);
+  return results;
 }
 
 /**
@@ -247,14 +277,17 @@ export async function cleanupExpiredSessions(
 
           const matchingFiles = filesByShortId.get(shortId) ?? [];
 
-          // Parallel extraction: read all sessionIds at once
-          const fileSessionIds = await Promise.all(
-            matchingFiles.map(async (file) => ({
+          // Parallel extraction: read all sessionIds at once, but cap concurrency
+          // to avoid saturating the filesystem when several files match.
+          const fileSessionIds = await mapWithConcurrency(
+            matchingFiles,
+            FILE_PROCESSING_CONCURRENCY,
+            async (file) => ({
               file,
               sessionId: await extractSessionIdFromFile(
                 path.join(chatsDir, file),
               ),
-            })),
+            }),
           );
 
           // Process in a single loop
@@ -569,9 +602,11 @@ export async function cleanupToolOutputFiles(
 
     const files = entries.filter((e) => e.isFile());
 
-    // Get file stats for age-based cleanup (parallel for better performance)
-    const fileStatsResults = await Promise.all(
-      files.map(async (file) => {
+    // Get file stats for age-based cleanup with bounded concurrency.
+    const fileStatsResults = await mapWithConcurrency(
+      files,
+      FILE_PROCESSING_CONCURRENCY,
+      async (file) => {
         try {
           const filePath = path.join(toolOutputDir, file.name);
           const stat = await fs.stat(filePath);
@@ -582,7 +617,7 @@ export async function cleanupToolOutputFiles(
           );
           return null;
         }
-      }),
+      },
     );
     const fileStats = fileStatsResults.filter(
       (f): f is { name: string; mtime: Date } => f !== null,
