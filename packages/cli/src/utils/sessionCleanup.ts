@@ -182,6 +182,7 @@ export async function cleanupExpiredSessions(
 
     const retentionConfig = settings.general.sessionRetention;
     const chatsDir = path.join(config.storage.getProjectTempDir(), 'chats');
+    const currentSessionId = config.getSessionId();
 
     // Validate retention configuration
     const validationErrorMessage = validateRetentionConfig(
@@ -194,7 +195,7 @@ export async function cleanupExpiredSessions(
       return { ...result, disabled: true };
     }
 
-    const allFiles = await getAllSessionFiles(chatsDir, config.getSessionId());
+    const allFiles = await getAllSessionFiles(chatsDir, currentSessionId);
     result.scanned = allFiles.length;
 
     if (allFiles.length === 0) {
@@ -206,6 +207,30 @@ export async function cleanupExpiredSessions(
       allFiles,
       retentionConfig,
     );
+
+    const shortIdsToProcess = new Set<string>();
+    for (const sessionToDelete of sessionsToDelete) {
+      const shortId = deriveShortIdFromFileName(sessionToDelete.fileName);
+      if (shortId) {
+        shortIdsToProcess.add(shortId);
+      }
+    }
+
+    // Pre-index files by shortId so we don't rescan allFiles per delete target.
+    const filesByShortId = new Map<string, string[]>();
+    for (const { fileName } of allFiles) {
+      const shortId = deriveShortIdFromFileName(fileName);
+      if (!shortId || !shortIdsToProcess.has(shortId)) {
+        continue;
+      }
+
+      const matchingFiles = filesByShortId.get(shortId);
+      if (matchingFiles) {
+        matchingFiles.push(fileName);
+      } else {
+        filesByShortId.set(shortId, [fileName]);
+      }
+    }
 
     const processedShortIds = new Set<string>();
 
@@ -220,14 +245,7 @@ export async function cleanupExpiredSessions(
           }
           processedShortIds.add(shortId);
 
-          const matchingFiles = allFiles
-            .map((f) => f.fileName)
-            .filter(
-              (f) =>
-                f.startsWith(SESSION_FILE_PREFIX) &&
-                (f.endsWith(`-${shortId}.json`) ||
-                  f.endsWith(`-${shortId}.jsonl`)),
-            );
+          const matchingFiles = filesByShortId.get(shortId) ?? [];
 
           // Parallel extraction: read all sessionIds at once
           const fileSessionIds = await Promise.all(
@@ -245,7 +263,7 @@ export async function cleanupExpiredSessions(
 
             try {
               // Delete the session file
-              if (!sessionId || sessionId !== config.getSessionId()) {
+              if (!sessionId || sessionId !== currentSessionId) {
                 await fs.unlink(filePath);
 
                 if (sessionId) {
@@ -352,11 +370,20 @@ export async function identifySessionsToDelete(
     }
   }
 
+  // Parse each timestamp once rather than repeatedly creating Date objects during
+  // sorting. This minimizes allocations while keeping the retention ordering stable.
+  const lastUpdatedBySession = new Map<SessionFileEntry, number>();
+  for (const entry of validSessions) {
+    lastUpdatedBySession.set(
+      entry,
+      new Date(entry.sessionInfo!.lastUpdated).getTime(),
+    );
+  }
+
   // Sort valid sessions by lastUpdated (newest first) for count-based retention
   const sortedValidSessions = [...validSessions].sort(
     (a, b) =>
-      new Date(b.sessionInfo!.lastUpdated).getTime() -
-      new Date(a.sessionInfo!.lastUpdated).getTime(),
+      lastUpdatedBySession.get(b)! - lastUpdatedBySession.get(a)!,
   );
 
   // Separate deletable sessions from the active session
@@ -565,7 +592,7 @@ export async function cleanupToolOutputFiles(
     fileStats.sort((a, b) => a.mtime.getTime() - b.mtime.getTime());
 
     const now = new Date();
-    const filesToDelete: string[] = [];
+    const filesToDelete = new Set<string>();
 
     // Age-based cleanup: delete files older than maxAge
     if (retentionConfig.maxAge) {
@@ -575,7 +602,7 @@ export async function cleanupToolOutputFiles(
 
         for (const file of fileStats) {
           if (file.mtime < cutoffDate) {
-            filesToDelete.push(file.name);
+            filesToDelete.add(file.name);
           }
         }
       } catch (error) {
@@ -591,14 +618,14 @@ export async function cleanupToolOutputFiles(
     if (retentionConfig.maxCount !== undefined) {
       // Filter out files already marked for deletion by age-based cleanup
       const remainingFiles = fileStats.filter(
-        (f) => !filesToDelete.includes(f.name),
+        (f) => !filesToDelete.has(f.name),
       );
       if (remainingFiles.length > retentionConfig.maxCount) {
         // Calculate how many excess files need to be deleted
         const excessCount = remainingFiles.length - retentionConfig.maxCount;
         // remainingFiles is already sorted oldest first, so delete from the start
         for (let i = 0; i < excessCount; i++) {
-          filesToDelete.push(remainingFiles[i].name);
+          filesToDelete.add(remainingFiles[i].name);
         }
       }
     }
