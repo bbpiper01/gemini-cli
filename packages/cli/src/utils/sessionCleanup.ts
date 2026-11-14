@@ -63,11 +63,15 @@ async function mapWithConcurrency<T, R>(
     return [];
   }
 
+  const safeConcurrency = Number.isFinite(concurrency)
+    ? Math.max(1, Math.floor(concurrency))
+    : 1;
+
   const results = new Array(items.length) as R[];
   let nextIndex = 0;
 
   const workers = Array.from(
-    { length: Math.min(concurrency, items.length) },
+    { length: Math.min(safeConcurrency, items.length) },
     async () => {
       while (true) {
         const index = nextIndex++;
